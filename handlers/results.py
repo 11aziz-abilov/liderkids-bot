@@ -1,5 +1,6 @@
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
 from config import ADMIN_ID
 from database import db
 from keyboards import get_main_keyboard, get_children_selection_keyboard
@@ -15,24 +16,25 @@ async def get_active_child_info(telegram_id: int):
     active_child = next((c for c in children if c.get("id") == active_id), children[0])
     return parent, active_child
 
+@router.message(Command("bugun"))
 @router.message(F.text == "📊 Bugungi natijalar")
 async def show_daily_results(message: Message):
     parent, child = await get_active_child_info(message.from_user.id)
     if not child:
         is_adm = (message.from_user.id == ADMIN_ID and ADMIN_ID != 0)
         await message.answer(
-            "⚠️ Hali birorta ham farzand bog'lanmagan. Iltimos, avval 6 xonali kod orqali farzandingizni ulang.",
+            "⚠️ Hali birorta ham farzand bog'lanmagan. Iltimos, avval 6 xonali kod orqali farzandingizni ulang (/ulash).",
             reply_markup=get_main_keyboard(has_child=False, is_admin=is_adm)
         )
         return
 
-    child_key = child.get("firebase_key") or child.get("id")
-    perf = await db.get_child_performance(child_key)
+    child_key = child.get("id") or child.get("firebase_key")
+    perf = await db.get_child_performance(child_key, period="today")
 
-    total_quizzes = perf["total_quizzes"]
-    percentage = perf["correct_percentage"]
-    weak_topics = perf["weak_topics"]
-    plan = perf["plan"]
+    total_quizzes = perf.get("total_quizzes", 0)
+    percentage = perf.get("correct_percentage", 0)
+    weak_topics = perf.get("weak_topics", [])
+    plan = perf.get("plan", "free")
 
     status_icon = "🟢" if percentage >= 80 else ("🟡" if percentage >= 60 else "🔴")
 
@@ -50,10 +52,55 @@ async def show_daily_results(message: Message):
         f"💎 <b>Tarif:</b> {'⭐️ PREMIUM' if plan == 'premium' else 'Standart'}\n\n"
         f"📝 <b>Yechilgan testlar:</b> {total_quizzes} ta\n"
         f"🎯 <b>To'g'ri javoblar foizi:</b> {status_icon} <b>{percentage}%</b>\n"
-        f"🔥 <b>Ketma-ketlik (Streak):</b> {perf['streaks']} kun\n"
-        f"🪙 <b>Bugungi tangalar:</b> +{perf['coins']} ta"
+        f"🔥 <b>Ketma-ketlik (Streak):</b> {perf.get('streaks', 0)} kun\n"
+        f"🪙 <b>Bugungi tangalar:</b> +{perf.get('coins', 0)} ta"
         f"{weak_text}\n"
         f"💡 <i>Tavsiya: Prezident maktabi imtihonlariga tayyorgarlik uchun har kuni kamida 20 ta test yechish va zaif mavzularni takrorlash tavsiya etiladi.</i>"
+    )
+
+    await message.answer(report_text, parse_mode="HTML")
+
+@router.message(Command("hafta"))
+@router.message(F.text == "📅 Haftalik hisobot")
+async def show_weekly_results(message: Message):
+    parent, child = await get_active_child_info(message.from_user.id)
+    if not child:
+        is_adm = (message.from_user.id == ADMIN_ID and ADMIN_ID != 0)
+        await message.answer(
+            "⚠️ Hali birorta ham farzand bog'lanmagan. Iltimos, avval 6 xonali kod orqali farzandingizni ulang (/ulash).",
+            reply_markup=get_main_keyboard(has_child=False, is_admin=is_adm)
+        )
+        return
+
+    child_key = child.get("id") or child.get("firebase_key")
+    perf = await db.get_child_performance(child_key, period="week")
+
+    total_quizzes = perf.get("total_quizzes", 0)
+    total_questions = perf.get("total_questions", 0)
+    total_correct = perf.get("correct_answers", 0)
+    percentage = perf.get("correct_percentage", 0)
+    weak_topics = perf.get("weak_topics", [])
+
+    status_icon = "🟢" if percentage >= 80 else ("🟡" if percentage >= 60 else "🔴")
+
+    weak_text = ""
+    if weak_topics:
+        weak_text = "\n\n⚠️ <b>Haftalik tahlil bo'yicha takrorlash tavsiya etiladigan mavzular:</b>\n"
+        for i, topic in enumerate(weak_topics, 1):
+            weak_text += f"  {i}. {topic}\n"
+    else:
+        weak_text = "\n\n🌟 <b>Hafta davomida zaif mavzular aniqlanmadi!</b> Ajoyib intizom! 👏\n"
+
+    report_text = (
+        f"📅 <b>Haftalik Natijalar Tahlili:</b>\n\n"
+        f"👦 <b>O'quvchi:</b> {perf['name']} ({perf['grade']}-sinf)\n"
+        f"📝 <b>Hafta davomida yechilgan testlar:</b> {total_quizzes} ta ({total_questions} savol)\n"
+        f"✅ <b>To'g'ri javoblar:</b> {total_correct} ta\n"
+        f"🎯 <b>O'rtacha aniqlik ko'rsatkichi:</b> {status_icon} <b>{percentage}%</b>\n"
+        f"🔥 <b>Ketma-ketlik (Streak):</b> {perf.get('streaks', 0)} kun\n"
+        f"🪙 <b>Haftalik tangalar:</b> +{perf.get('coins', 0)} ta"
+        f"{weak_text}\n"
+        f"🦁 <i>LiderKids haftalik hisoboti</i>"
     )
 
     await message.answer(report_text, parse_mode="HTML")

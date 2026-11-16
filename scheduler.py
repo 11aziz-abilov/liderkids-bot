@@ -74,14 +74,59 @@ async def send_evening_reports(bot: Bot):
             except Exception as e:
                 print(f"[Daily Report Error] ID: {telegram_id} -> {e}")
 
+async def check_inactive_children(bot: Bot):
+    """
+    24 soatdan beri platformaga kirmagan o'quvchilarning ota-onalariga eslatma yuborish
+    """
+    try:
+        inactive_list = await db.get_inactive_students_for_alert()
+        if not inactive_list:
+            return
+
+        for student in inactive_list:
+            name = student.get("name", "Farzandingiz")
+            streak = student.get("streak", 0)
+            parent_links = student.get("parent_links", [])
+            if not parent_links:
+                continue
+
+            for pl in parent_links:
+                tg_id = pl.get("telegram_chat_id")
+                if not tg_id:
+                    continue
+
+                msg = (
+                    f"⏰ <b>Shercha eslatmasi!</b>\n\n"
+                    f"Farzandingiz <b>{name}</b> oxirgi 24 soat davomida LiderKids platformasiga kirmadi.\n\n"
+                    f"🔥 <b>{streak} kunlik</b> olovcha (streak) uzilib qolmasligi va Prezident maktabiga "
+                    f"tayyorgarlik uzluksiz davom etishi uchun bugungi darslarni bajarishini eslatib qo'ying! 🦁\n\n"
+                    f"🌐 https://lider-kids-lime.vercel.app"
+                )
+                try:
+                    await bot.send_message(chat_id=tg_id, text=msg, parse_mode="HTML")
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logging.warning(f"[Inactivity Alert Error] {tg_id} -> {e}")
+    except Exception as err:
+        logging.error(f"[Inactivity Alert Check Error] -> {err}")
+
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     """Rejalashtiruvchini sozlash va ishga tushirish"""
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    # 1. Kunlik kechki hisobot (20:00)
     scheduler.add_job(
         send_evening_reports,
         trigger="cron",
         hour=REPORT_HOUR,
         minute=REPORT_MINUTE,
+        args=[bot]
+    )
+    # 2. 24 soat kirmaganlikni har kuni soat 14:00 da tekshirish
+    scheduler.add_job(
+        check_inactive_children,
+        trigger="cron",
+        hour=14,
+        minute=0,
         args=[bot]
     )
     scheduler.start()

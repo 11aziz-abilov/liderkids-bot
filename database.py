@@ -1,255 +1,262 @@
 import aiohttp
-import asyncio
-from datetime import datetime
+import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
-import hashlib
-from config import FIREBASE_DB_URL
+from config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
-def generate_child_code(student_id: str) -> str:
-    """
-    Agar o'quvchida alohida linkCode bo'lmasa,
-    har bir o'quvchi uchun barqaror 6 xonali noyob kod yaratish
-    """
-    digest = hashlib.md5(student_id.encode('utf-8')).hexdigest()
-    # 6 xonali son (100000 - 999999)
-    number = int(digest[:8], 16) % 900000 + 100000
-    return str(number)
+logger = logging.getLogger(__name__)
+
+# Tashkent timezone offset (+05:00)
+TASHKENT_TZ = timezone(timedelta(hours=5))
 
 class Database:
-    def __init__(self, base_url: str = FIREBASE_DB_URL):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: str = SUPABASE_URL, key: str = SUPABASE_SERVICE_ROLE_KEY):
+        self.base_url = (base_url or "").rstrip("/")
+        self.key = key or ""
+        self._active_children: Dict[int, str] = {}
 
-    async def _request(self, method: str, path: str, data: Any = None) -> Any:
-        url = f"{self.base_url}/{path.lstrip('/')}"
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+
+    async def _request(self, method: str, table: str, params: Optional[Dict[str, str]] = None, json_data: Any = None) -> Any:
+        if not self.base_url or not self.key:
+            logger.warning("Supabase URL yoki API kaliti sozlanmagan!")
+            return None
+
+        url = f"{self.base_url}/rest/v1/{table}"
         async with aiohttp.ClientSession() as session:
             try:
-                if method.upper() == "GET":
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
+                async with session.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    params=params,
+                    json=json_data,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status in (200, 201):
+                        return await resp.json()
+                    elif resp.status == 204:
+                        return True
+                    else:
+                        text = await resp.text()
+                        logger.error(f"Supabase {method} {table} error ({resp.status}): {text}")
                         return None
-                elif method.upper() == "PUT":
-                    async with session.put(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        return resp.status in (200, 201)
-                elif method.upper() == "PATCH":
-                    async with session.patch(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        return resp.status in (200, 204)
-                elif method.upper() == "POST":
-                    async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status in (200, 201):
-                            return await resp.json()
-                        return None
-                elif method.upper() == "DELETE":
-                    async with session.delete(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        return resp.status == 200
             except Exception as e:
-                print(f"[Database Error] {method} {url} -> {e}")
+                logger.error(f"Supabase connection error: {e}")
                 return None
 
-    # --- O'QUVCHILAR BILAN ISHLASH ---
-    async def get_all_learners(self) -> Dict[str, Any]:
-        """Barcha o'quvchilarni yuklab olish"""
-        data = await self._request("GET", "learners.json")
-        return data or {}
-
-    async def get_learner_by_id(self, learner_id: str) -> Optional[Dict[str, Any]]:
-        """ID bo'yicha bitta o'quvchini olish"""
-        safe_key = learner_id.replace(".", "_").replace("#", "_").replace("$", "_").replace("[", "_").replace("]", "_").replace("/", "_")
-        return await self._request("GET", f"learners/{safe_key}.json")
-
-    async def find_learner_by_code(self, code: str) -> Optional[Dict[str, Any]]:
+    # --- 1. FARZANDNI 6 XONALI KOD BILAN BOG'LASH ---
+    async def verify_and_link_code(self, code: str, telegram_chat_id: int) -> Optional[Dict[str, Any]]:
         """
-        6 xonali kod orqali bolani topish.
-        1. Avval linkCode yoki parentCode bo'yicha qidiradi.
-        2. Topilmasa, deterministik generatsiya qilingan kod orqali qidiradi.
+        6 xonali ulanish kodini link_codes jadvalida tekshirish (15 daqiqalik va bir martalik).
+        Agar to'g'ri bo'lsa:
+        1. link_codes.used = true qilib belgilanadi.
+        2. parent_links jadvaliga (telegram_chat_id, student_id) saqlanadi.
+        3. O'quvchi ma'lumotlari qaytariladi.
         """
-        code = str(code).strip()
-        learners = await self.get_all_learners()
+        clean_code = str(code).strip()
+        now_iso = datetime.now(timezone.utc).isoformat()
 
-        for key, learner in learners.items():
-            if not isinstance(learner, dict):
-                continue
-            
-            # Agar mavjud linkCode bo'lsa
-            existing_code = learner.get("linkCode") or learner.get("parentCode")
-            if existing_code and str(existing_code).strip() == code:
-                learner["firebase_key"] = key
-                return learner
-
-            # ID orqali hisoblangan kod
-            l_id = learner.get("id") or key
-            calc_code = generate_child_code(str(l_id))
-            if calc_code == code:
-                learner["firebase_key"] = key
-                # Kodni bazada ham mustahkamlab qo'yamiz
-                await self._request("PATCH", f"learners/{key}.json", {"parentCode": code})
-                return learner
-
-        return None
-
-    async def update_learner_plan(self, learner_key_or_id: str, plan: str = "premium") -> bool:
-        """Bolaning plan maydonini yangilash (masalan 'premium')"""
-        safe_key = learner_key_or_id.replace(".", "_").replace("#", "_").replace("$", "_").replace("[", "_").replace("]", "_").replace("/", "_")
-        payload = {
-            "plan": plan,
-            "planActivatedAt": datetime.now().isoformat(),
-            "updatedAt": datetime.now().isoformat()
+        # Kodni tekshirish
+        params = {
+            "code": f"eq.{clean_code}",
+            "used": "eq.false",
+            "expires_at": f"gt.{now_iso}",
+            "select": "*",
+            "limit": "1",
         }
-        return bool(await self._request("PATCH", f"learners/{safe_key}.json", payload))
+        records = await self._request("GET", "link_codes", params=params)
 
-    # --- OTA-ONALAR BILAN ISHLASH ---
+        if not records or len(records) == 0:
+            return None
+
+        link_record = records[0]
+        code_id = link_record["id"]
+        student_id = link_record["student_id"]
+
+        # 1. Kodni ishlatilgan (used = true) deb belgilash
+        patch_params = {"id": f"eq.{code_id}"}
+        await self._request("PATCH", "link_codes", params=patch_params, json_data={"used": True})
+
+        # 2. parent_links ga kiritish
+        link_payload = {
+            "telegram_chat_id": telegram_chat_id,
+            "student_id": student_id,
+            "created_at": now_iso,
+        }
+        # Upsert parent link
+        await self._request("POST", "parent_links", json_data=link_payload)
+
+        # 3. O'quvchi ma'lumotlarini yuklash
+        return await self.get_student_by_id(student_id)
+
+    async def get_student_by_id(self, student_id: str) -> Optional[Dict[str, Any]]:
+        """O'quvchini ID orqali olish"""
+        params = {"id": f"eq.{student_id}", "select": "*", "limit": "1"}
+        records = await self._request("GET", "students", params=params)
+        return records[0] if records and len(records) > 0 else None
+
+    # --- 2. OTA-ONANING FARZANDLARI RO'YXATI ---
+    async def get_parent_children(self, telegram_chat_id: int) -> List[Dict[str, Any]]:
+        """Ushbu ota-onaga bog'langan barcha o'quvchilarni olish"""
+        params = {
+            "telegram_chat_id": f"eq.{telegram_chat_id}",
+            "select": "student_id, students(*)",
+        }
+        records = await self._request("GET", "parent_links", params=params)
+        if not records:
+            return []
+
+        children = []
+        for r in records:
+            student = r.get("students")
+            if student:
+                children.append(student)
+            elif r.get("student_id"):
+                s = await self.get_student_by_id(r["student_id"])
+                if s:
+                    children.append(s)
+        return children
+
     async def get_parent(self, telegram_id: int) -> Optional[Dict[str, Any]]:
-        """Ota-onaning botdagi profilini olish"""
-        return await self._request("GET", f"parents/{telegram_id}.json")
-
-    async def link_child_to_parent(self, telegram_id: int, parent_name: str, child: Dict[str, Any]) -> bool:
-        """Bolani ota-onaga bog'lash"""
-        current = await self.get_parent(telegram_id) or {
+        """Ota-onaning profili va bog'langan farzandlari"""
+        children = await self.get_parent_children(telegram_id)
+        if not children:
+            return None
+        active_id = self._active_children.get(telegram_id)
+        if not active_id and children:
+            active_id = children[0].get("id")
+        return {
             "telegram_id": telegram_id,
-            "name": parent_name,
-            "joinedAt": datetime.now().isoformat(),
-            "children": []
+            "children": children,
+            "active_child_id": active_id
         }
 
-        children = current.get("children", [])
-        child_id = child.get("id") or child.get("firebase_key")
+    async def set_active_child(self, telegram_id: int, child_id: str):
+        """Faol farzandni xotirada saqlash"""
+        self._active_children[telegram_id] = child_id
 
-        # Bolani ro'yxatda bor-yo'qligini tekshirish
-        exists = any(c.get("id") == child_id for c in children)
-        if not exists:
-            children.append({
-                "id": child_id,
-                "firebase_key": child.get("firebase_key", child_id),
-                "name": child.get("name", "Noma'lum"),
-                "grade": child.get("grade", 1),
-                "linkedAt": datetime.now().isoformat()
-            })
-            current["children"] = children
-            current["active_child_id"] = child_id
-            await self._request("PUT", f"parents/{telegram_id}.json", current)
-
-        # Shuningdek, o'quvchi ma'lumotlariga ham ota-ona Telegram ID sini yozib qo'yamiz
-        child_key = child.get("firebase_key") or child_id
-        await self._request("PATCH", f"learners/{child_key}.json", {
-            "parentTelegramId": telegram_id,
-            "parentLinkedAt": datetime.now().isoformat()
-        })
-
-        return True
-
-    async def set_active_child(self, telegram_id: int, child_id: str) -> bool:
-        """Ota-ona bir nechta farzandi bo'lsa, joriy ko'rilayotgan faol farzandni tanlash"""
-        return bool(await self._request("PATCH", f"parents/{telegram_id}.json", {"active_child_id": child_id}))
+    async def get_learner_by_id(self, student_id: str) -> Optional[Dict[str, Any]]:
+        """get_student_by_id uchun moslik funksiyasi"""
+        return await self.get_student_by_id(student_id)
 
     async def get_all_parents(self) -> Dict[str, Any]:
-        """Barcha ota-onalar ro'yxatini olish (har kuni kechqurun hisobot yuborish uchun)"""
-        return await self._request("GET", "parents.json") or {}
+        """Barcha ota-onalarni dict formatida qaytarish"""
+        records = await self.get_all_linked_parents_for_report()
+        parents: Dict[str, Dict[str, Any]] = {}
+        for r in records:
+            tg_id = str(r.get("telegram_chat_id"))
+            if not tg_id:
+                continue
+            if tg_id not in parents:
+                parents[tg_id] = {"children": []}
+            student = r.get("students")
+            if student:
+                parents[tg_id]["children"].append(student)
+        return parents
 
-    # --- NATIJALAR VA STATISTIKA ---
-    async def get_child_performance(self, learner_key_or_id: str) -> Dict[str, Any]:
-        """
-        Bolaning natijalarini to'plash:
-        - Yechilgan testlar soni
-        - To'g'ri javoblar foizi
-        - Zaif mavzular
-        """
-        learner = await self.get_learner_by_id(learner_key_or_id)
-        if not learner:
-            # key orqali qidirish
-            learners = await self.get_all_learners()
-            learner = learners.get(learner_key_or_id)
+    async def get_all_learners(self) -> List[Dict[str, Any]]:
+        """Barcha o'quvchilar ro'yxati"""
+        records = await self._request("GET", "students", params={"select": "*"})
+        return records or []
 
-        if not learner:
+    async def update_learner_plan(self, student_id: str, plan: str = "premium") -> bool:
+        """O'quvchi rejasini yangilash"""
+        res = await self._request("PATCH", "students", params={"id": f"eq.{student_id}"}, json_data={"plan": plan})
+        return bool(res)
+
+    # --- 3. NATIJALAR VA STATISTIKA (/bugun va /hafta) ---
+    async def get_child_performance(self, student_id: str, period: str = "today") -> Dict[str, Any]:
+        """
+        O'quvchining bugungi yoki haftalik natijalarini results jadvalidan to'plash
+        """
+        student = await self.get_student_by_id(student_id)
+        if not student:
             return {
-                "name": "Noma'lum",
+                "name": "Noma'lum o'quvchi",
                 "grade": 1,
                 "total_quizzes": 0,
+                "correct_answers": 0,
                 "correct_percentage": 0,
                 "weak_topics": [],
                 "streaks": 0,
                 "coins": 0,
                 "xp": 0,
-                "plan": "free"
             }
 
-        # Agar bazada maxsus stats yoki quizHistory bo'lsa:
-        stats = learner.get("stats") or {}
-        today_stats = learner.get("todayStats") or {}
-        quiz_history = learner.get("quizHistory") or []
+        now_tashkent = datetime.now(TASHKENT_TZ)
+        if period == "week":
+            # Haftaning dushanba kunidan boshlab
+            start_date = (now_tashkent - timedelta(days=now_tashkent.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            # Bugungi kun 00:00 dan boshlab
+            start_date = now_tashkent.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        # Umumiy ko'rsatkichlar
-        streaks = learner.get("streaks", 0)
-        coins = learner.get("coins", 0)
-        xp = learner.get("xp", 0)
-        plan = learner.get("plan", "free")
+        start_iso = start_date.astimezone(timezone.utc).isoformat()
 
-        # Testlar soni
-        quizzes_count = today_stats.get("quizzesCount")
-        if quizzes_count is None:
-            # Agar bugungi stats bo'lmasa, umumiy completedQuizzes yoki xp dan hisoblash
-            completed_quizzes = learner.get("completedQuizzes") or []
-            quizzes_count = len(completed_quizzes) if completed_quizzes else max(1, xp // 35)
+        params = {
+            "student_id": f"eq.{student_id}",
+            "created_at": f"gte.{start_iso}",
+            "select": "*",
+        }
+        results = await self._request("GET", "results", params=params) or []
 
-        # To'g'ri javoblar foizi
-        percentage = today_stats.get("accuracy")
-        if percentage is None:
-            percentage = stats.get("accuracy", 85) # O'rtacha 85%
+        total_quizzes = len(results)
+        total_correct = sum(r.get("correct", 0) for r in results)
+        total_questions = sum(r.get("total", 0) for r in results)
+        period_coins = sum(r.get("coins_earned", 0) for r in results)
 
-        # Zaif mavzular
-        weak_topics = today_stats.get("weakTopics") or stats.get("weakTopics") or []
-        if not weak_topics:
-            # Agar mavjud bo'lmasa, sinfiga mos zaif bo'lishi mumkin bo'lgan mavzular misoli
-            grade = learner.get("grade", 1)
-            default_topics = {
-                1: ["Matematika: Qo'shish va ayirish amallari", "Mantiq: Shakllar ketma-ketligi"],
-                2: ["Matematika: Karra jadvali", "Tanqidiy fikrlash: Mantiqiy xulosalar"],
-                3: ["Mantiq: Fazoviy fikrlash (3D kublar)", "Ingliz tili: Matnni tushunish (Reading)"],
-                4: ["Tanqidiy fikrlash: Argumentlar tahlili", "Matematika: Murakkab matnli masalalar"]
-            }
-            # Agar foiz 100% dan kam bo'lsa bitta tavsiya ko'rsatiladi
-            if percentage < 90:
-                weak_topics = default_topics.get(grade, ["Mantiqiy savollar"])
+        accuracy = round((total_correct / total_questions) * 100) if total_questions > 0 else 0
+
+        # Zaif mavzular: qaysi fan/mavzuda xatolar ko'p bo'lsa
+        weak_set = set()
+        subject_names = {
+            "math": "Matematika",
+            "logic": "Muammoli masalalar (Mantiq)",
+            "critical": "Tanqidiy fikrlash",
+            "english": "Ingliz tili",
+        }
+        for r in results:
+            correct = r.get("correct", 0)
+            total = r.get("total", 0)
+            if total > 0 and correct < total:
+                subj = r.get("subject", "general")
+                subj_title = subject_names.get(subj, subj.capitalize())
+                weak_set.add(subj_title)
 
         return {
-            "name": learner.get("name", "O'quvchi"),
-            "grade": learner.get("grade", 1),
-            "total_quizzes": quizzes_count,
-            "correct_percentage": percentage,
-            "weak_topics": weak_topics,
-            "streaks": streaks,
-            "coins": coins,
-            "xp": xp,
-            "plan": plan
+            "name": student.get("name", "O'quvchi"),
+            "grade": student.get("grade", 1),
+            "total_quizzes": total_quizzes,
+            "total_questions": total_questions,
+            "correct_answers": total_correct,
+            "correct_percentage": accuracy,
+            "weak_topics": list(weak_set),
+            "streaks": student.get("streak", 0),
+            "coins": period_coins if period_coins > 0 else student.get("coins", 0),
+            "total_coins": student.get("coins", 0),
+            "xp": student.get("xp", 0),
         }
 
-    # --- TO'LOV VA CHEKLAR ---
-    async def create_payment_request(self, telegram_id: int, parent_name: str, child_key: str, child_name: str, photo_file_id: str, amount: str) -> str:
-        """To'lov cheki arizasini yaratish"""
-        payment_id = f"pay_{telegram_id}_{int(datetime.now().timestamp())}"
-        data = {
-            "payment_id": payment_id,
-            "telegram_id": telegram_id,
-            "parent_name": parent_name,
-            "child_key": child_key,
-            "child_name": child_name,
-            "photo_file_id": photo_file_id,
-            "amount": amount,
-            "status": "pending",  # pending | approved | rejected
-            "createdAt": datetime.now().isoformat()
+    # --- 4. REJALASHTIRILGAN JOB'LAR UCHUN ---
+    async def get_all_linked_parents_for_report(self) -> List[Dict[str, Any]]:
+        """Har kuni soat 20:00 da hisobot jo'natish uchun barcha ota-onalar va farzandlar"""
+        params = {"select": "telegram_chat_id, student_id, students(*)"}
+        return await self._request("GET", "parent_links", params=params) or []
+
+    async def get_inactive_students_for_alert(self) -> List[Dict[str, Any]]:
+        """24 soatdan beri kirmagan o'quvchilarni topish"""
+        threshold = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        params = {
+            "last_active_at": f"lt.{threshold}",
+            "select": "id, name, grade, streak, last_active_at, parent_links(telegram_chat_id)",
         }
-        await self._request("PUT", f"payments/{payment_id}.json", data)
-        return payment_id
+        return await self._request("GET", "students", params=params) or []
 
-    async def get_payment_request(self, payment_id: str) -> Optional[Dict[str, Any]]:
-        return await self._request("GET", f"payments/{payment_id}.json")
-
-    async def update_payment_status(self, payment_id: str, status: str, admin_id: int) -> bool:
-        """To'lov holatini tasdiqlash yoki rad etish"""
-        return bool(await self._request("PATCH", f"payments/{payment_id}.json", {
-            "status": status,
-            "reviewedBy": admin_id,
-            "reviewedAt": datetime.now().isoformat()
-        }))
-
-# Global singleton ob'ekt
 db = Database()

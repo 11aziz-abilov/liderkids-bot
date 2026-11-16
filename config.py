@@ -8,11 +8,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Firebase Realtime Database URL
-FIREBASE_DB_URL = os.getenv(
-    "FIREBASE_DB_URL",
-    "https://liderkids-afad8-default-rtdb.firebaseio.com"
-).rstrip("/")
+# Supabase (Postgres) sozlamalari
+SUPABASE_URL = os.getenv("SUPABASE_URL", os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")).rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", ""))
 
 # To'lov ma'lumotlari
 CARD_NUMBER = os.getenv("CARD_NUMBER", "9860 1201 2345 6789")

@@ -47,7 +47,10 @@ async def cmd_start(message: Message, state: FSMContext):
         welcome_text = (
             f"Assalomu alaykum, <b>{user_name}</b>! 👋\n\n"
             f"Tanlangan farzand: <b>{child_name}</b> ({child_grade}-sinf)\n\n"
-            f"Quyidagi menyu orqali kerakli bo'limni tanlang:"
+            f"Quyidagi menyu yoki buyruqlar orqali kerakli bo'limni tanlang:\n"
+            f"• /bugun — Bugungi natijalar\n"
+            f"• /hafta — Haftalik hisobot\n"
+            f"• /ulash — Yangi farzand ulash"
         )
         if is_admin:
             welcome_text += "\n\n👑 <i>Administrator rejimi faol.</i>"
@@ -80,10 +83,14 @@ async def help_handler(message: Message):
         "🔹 <b>Qanday bog'lanadi?</b>\n"
         "Farzandingiz LiderKids ilovasiga kirganida uning profilida 6 xonali kod chiqadi. "
         "Shu kodni ushbu botga kiritasiz.\n\n"
+        "🔹 <b>Asosiy buyruqlar:</b>\n"
+        "/bugun — Bugungi test natijalari, foizlar va tangalar\n"
+        "/hafta — Haftalik o'zlashtirish tahlili\n"
+        "/ulash — 6 xonali ulanish kodi orqali farzandni ulash\n\n"
         "🔹 <b>Har kuni hisobot:</b>\n"
         "Bot har kuni soat 20:00 da bolangizning kunlik yechgan testlari, foizi va zaif mavzulari haqida "
         "xabar yuboradi.\n\n"
         "📞 Savollar yoki yordam uchun: @LiderKidsAdmin\n"
-        "🌐 Veb-sayt: liderkids.uz"
+        "🌐 Veb-sayt: https://lider-kids-lime.vercel.app"
     )
     await message.answer(help_text, parse_mode="HTML")
